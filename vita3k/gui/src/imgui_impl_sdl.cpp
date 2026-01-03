@@ -197,6 +197,14 @@ bool ImGui_ImplSdl_ProcessEvent(ImGui_State *state, SDL_Event *event) {
         case SDL_BUTTON_X2: mouse_button = 4; break;
         default: return false;
         }
+
+#ifdef __ANDROID__
+        if ((event->type == SDL_EVENT_MOUSE_BUTTON_UP) && (mouse_button == 0) && !(state->mouse_buttons_down & 1)) {
+            // handle the case when a long touch is turned into a right click
+            return true;
+        }
+#endif
+
         io.AddMouseButtonEvent(mouse_button, (event->type == SDL_EVENT_MOUSE_BUTTON_DOWN));
         state->mouse_buttons_down = (event->type == SDL_EVENT_MOUSE_BUTTON_DOWN) ? (state->mouse_buttons_down | (1 << mouse_button)) : (state->mouse_buttons_down & ~(1 << mouse_button));
         return true;
@@ -427,7 +435,60 @@ static void ImGui_ImplSDL3_UpdateGamepads(ImGui_State *state) {
 #undef MAP_ANALOG
 }
 
+static void ImGui_ImplSdl_FreeTextures(ImGui_State *state) {
+    std::lock_guard<std::mutex> lock(state->textures_to_free_mutex);
+    switch (state->renderer->current_backend) {
+    case renderer::Backend::OpenGL: {
+        for (auto texture : state->textures_to_free) {
+            ImGui_ImplSdlGL3_DeleteTexture(texture);
+        }
+        break;
+    }
+    case renderer::Backend::Vulkan: {
+        for (auto texture : state->textures_to_free) {
+            ImGui_ImplSdlVulkan_DeleteTexture(dynamic_cast<ImGui_VulkanState &>(*state), texture);
+        }
+        break;
+    }
+
+    default:
+        LOG_ERROR("Missing ImGui init for backend {}.", static_cast<int>(state->renderer->current_backend));
+    }
+    state->textures_to_free.clear();
+}
+
+#ifdef __ANDROID__
+static void ImGui_ImplSDL3_HandleTouch(ImGui_State *state) {
+    ImGuiIO &io = ImGui::GetIO();
+
+    // Check if left mouse button is currently pressed
+    if (state->mouse_buttons_down & 1) {
+        // If left button held for more than 1 second without dragging, turn it into a right click
+        if (io.MouseDownDuration[0] >= 1.0f && !ImGui::IsMouseDragging(0)) {
+            // Reset left click states
+            io.MouseClickedTime[0] = 0.0f;
+            io.MouseClicked[0] = false;
+            io.MouseDown[0] = false;
+            io.MouseReleased[0] = false;
+            io.MouseDownDuration[0] = -1.0f;
+
+            // Set active ID to avoid phantom interactions
+            ImGui::SetActiveID(0, ImGui::GetCurrentContext()->CurrentWindow);
+
+            // Simulate right click press and release
+            io.AddMouseButtonEvent(1, true); // right button down
+            io.AddMouseButtonEvent(1, false); // right button up
+
+            // Mark left button as released in the state
+            state->mouse_buttons_down &= ~1;
+        }
+    }
+}
+#endif
+
 IMGUI_API void ImGui_ImplSdl_NewFrame(ImGui_State *state) {
+    // Free textures, marked as deleted on previous frame.
+    ImGui_ImplSdl_FreeTextures(state);
     ImGuiIO &io = ImGui::GetIO();
 
     // Setup display size (every frame to accommodate for window resizing)
@@ -454,6 +515,10 @@ IMGUI_API void ImGui_ImplSdl_NewFrame(ImGui_State *state) {
 
     // Update game controllers (if enabled and available)
     ImGui_ImplSDL3_UpdateGamepads(state);
+
+#ifdef __ANDROID__
+    ImGui_ImplSDL3_HandleTouch(state);
+#endif
 
     // Start the frame. This call will update the io.WantCaptureMouse, io.WantCaptureKeyboard flag that you can use to dispatch inputs (or not) to your application.
     ImGui::NewFrame();
@@ -493,16 +558,8 @@ IMGUI_API ImTextureID ImGui_ImplSdl_CreateTexture(ImGui_State *state, void *data
 }
 
 IMGUI_API void ImGui_ImplSdl_DeleteTexture(ImGui_State *state, ImTextureID texture) {
-    switch (state->renderer->current_backend) {
-    case renderer::Backend::OpenGL:
-        return ImGui_ImplSdlGL3_DeleteTexture(texture);
-
-    case renderer::Backend::Vulkan:
-        return ImGui_ImplSdlVulkan_DeleteTexture(dynamic_cast<ImGui_VulkanState &>(*state), texture);
-
-    default:
-        LOG_ERROR("Missing ImGui init for backend {}.", static_cast<int>(state->renderer->current_backend));
-    }
+    std::lock_guard<std::mutex> lock(state->textures_to_free_mutex);
+    state->textures_to_free.push_back(texture);
 }
 
 // Use if you want to reset your rendering device without losing ImGui state.
@@ -532,17 +589,10 @@ IMGUI_API bool ImGui_ImplSdl_CreateDeviceObjects(ImGui_State *state) {
     }
 }
 
-void ImGui_Texture::init(ImGui_State *new_state, ImTextureID texture) {
-    assert(!texture_id);
-
+ImGui_Texture::ImGui_Texture(ImGui_State *new_state, void *data, int width, int height) {
     state = new_state;
-    texture_id = texture;
+    texture_id = ImGui_ImplSdl_CreateTexture(new_state, data, width, height);
 }
-
-void ImGui_Texture::init(ImGui_State *new_state, void *data, int width, int height) {
-    init(new_state, ImGui_ImplSdl_CreateTexture(new_state, data, width, height));
-}
-
 ImGui_Texture::operator bool() const {
     return texture_id != nullptr;
 }
@@ -551,29 +601,19 @@ ImGui_Texture::operator ImTextureID() const {
     return texture_id;
 }
 
-bool ImGui_Texture::operator==(const ImGui_Texture &texture) {
+bool ImGui_Texture::operator==(const ImGui_Texture &texture) const {
     return texture_id == texture.texture_id;
 }
 
+ImGui_Texture::ImGui_Texture(ImGui_Texture &&texture) noexcept {
+    std::swap(state, texture.state);
+    std::swap(texture_id, texture.texture_id);
+}
+
 ImGui_Texture &ImGui_Texture::operator=(ImGui_Texture &&texture) noexcept {
-    this->state = texture.state;
-    this->texture_id = texture.texture_id;
-
-    texture.state = nullptr;
-    texture.texture_id = nullptr;
-
+    std::swap(state, texture.state);
+    std::swap(texture_id, texture.texture_id);
     return *this;
-}
-
-ImGui_Texture::ImGui_Texture(ImGui_State *new_state, void *data, int width, int height) {
-    init(new_state, data, width, height);
-}
-
-ImGui_Texture::ImGui_Texture(ImGui_Texture &&texture) noexcept
-    : state(texture.state)
-    , texture_id(texture.texture_id) {
-    texture.state = nullptr;
-    texture.texture_id = nullptr;
 }
 
 ImGui_Texture::~ImGui_Texture() {

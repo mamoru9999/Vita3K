@@ -29,6 +29,7 @@
 #include <display/state.h>
 #include <gui/functions.h>
 #include <gxm/state.h>
+#include <host/dialog/filesystem.h>
 #include <io/functions.h>
 #include <io/vfs.h>
 #include <kernel/state.h>
@@ -52,6 +53,7 @@
 #include <regex>
 
 #include <SDL3/SDL_events.h>
+#include <SDL3/SDL_system.h>
 #include <SDL3/SDL_video.h>
 
 #include <fmt/chrono.h>
@@ -248,6 +250,9 @@ static std::vector<std::string> get_archive_contents_path(const ZipPtr &zip) {
         std::string m_filename = std::string(file_stat.m_filename);
         if (m_filename.find("sce_module/steroid.suprx") != std::string::npos) {
             LOG_CRITICAL("A Vitamin dump was detected, aborting installation...");
+#ifdef __ANDROID__
+            SDL_ShowAndroidToast("Vitamin dumps are not supported!", 1, -1, 0, 0);
+#endif
             content_path.clear();
             break;
         }
@@ -264,14 +269,14 @@ static std::vector<std::string> get_archive_contents_path(const ZipPtr &zip) {
 }
 
 std::vector<ContentInfo> install_archive(EmuEnvState &emuenv, GuiState *gui, const fs::path &archive_path, const std::function<void(ArchiveContents)> &progress_callback) {
-    if (!fs::exists(archive_path)) {
-        LOG_CRITICAL("Failed to load archive file in path: {}", archive_path.generic_path());
+    FILE *vpk_fp = host::dialog::filesystem::resolve_host_handle(archive_path);
+
+    if (!vpk_fp) {
+        LOG_CRITICAL("Failed to load archive file in path: {}", archive_path.generic_path().string());
         return {};
     }
     const ZipPtr zip(new mz_zip_archive, delete_zip);
     std::memset(zip.get(), 0, sizeof(*zip));
-
-    FILE *vpk_fp = FOPEN(archive_path.generic_path().c_str(), "rb");
 
     if (!mz_zip_reader_init_cfile(zip.get(), vpk_fp, 0, 0)) {
         LOG_CRITICAL("miniz error reading archive: {}", miniz_get_error(zip));
@@ -409,6 +414,13 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv) {
     LOG_INFO("CPU Optimisation state: {}", emuenv.cfg.current_config.cpu_opt);
     LOG_INFO("ngs state: {}", emuenv.cfg.current_config.ngs_enable);
     LOG_INFO("Resolution multiplier: {}", emuenv.cfg.resolution_multiplier);
+
+    // Set controller overlay state
+    if (emuenv.cfg.enable_gamepad_overlay) {
+        gui::set_controller_overlay_state(gui::get_overlay_display_mask(emuenv.cfg));
+        refresh_controllers(emuenv.ctrl, emuenv);
+    }
+
     if (emuenv.ctrl.controllers_num) {
         LOG_INFO("{} Controllers Connected", emuenv.ctrl.controllers_num);
         for (auto controller_it = emuenv.ctrl.controllers.begin(); controller_it != emuenv.ctrl.controllers.end(); ++controller_it) {
@@ -514,25 +526,50 @@ static void toggle_texture_replacement(EmuEnvState &emuenv) {
     emuenv.renderer->get_texture_cache()->set_replacement_state(emuenv.cfg.current_config.import_textures, emuenv.cfg.current_config.export_textures, emuenv.cfg.current_config.export_as_png);
 }
 
+static std::vector<uint32_t> get_current_app_frame(EmuEnvState &emuenv, uint32_t &width, uint32_t &height) {
+    // Dump the current frame from the emulator display
+    std::vector<uint32_t> frame = emuenv.renderer->dump_frame(emuenv.display, width, height);
+    if (frame.empty() || (frame.size() != (width * height))) {
+        return {};
+    }
+
+    // Force alpha channel to 255 (fully opaque) for every pixel
+    for (uint32_t &pixel : frame) {
+        pixel |= 0xFF000000;
+    }
+
+    return frame;
+}
+
+static void update_live_area_last_app_frame(EmuEnvState &emuenv, GuiState &gui) {
+    uint32_t width, height;
+
+    // Capture the current frame of the app
+    auto frame = get_current_app_frame(emuenv, width, height);
+    if (frame.empty()) {
+        LOG_ERROR("Failed to dump current app frame for live area");
+        return;
+    }
+
+    // Create and assign a new texture with the captured frame
+    gui.live_area_last_app_frame = ImGui_Texture(gui.imgui_state.get(), frame.data(), width, height);
+}
+
 static void take_screenshot(EmuEnvState &emuenv) {
     if (emuenv.cfg.screenshot_format == None)
         return;
 
     if (emuenv.io.title_id.empty()) {
         LOG_ERROR("Trying to take a screenshot while not ingame");
-    }
-
-    uint32_t width, height;
-    std::vector<uint32_t> frame = emuenv.renderer->dump_frame(emuenv.display, width, height);
-
-    if (frame.empty() || frame.size() != width * height) {
-        LOG_ERROR("Failed to take screenshot");
         return;
     }
 
-    // set the alpha to 1
-    for (int i = 0; i < width * height; i++)
-        frame[i] |= 0xFF000000;
+    uint32_t width, height;
+    auto frame = get_current_app_frame(emuenv, width, height);
+    if (frame.empty()) {
+        LOG_ERROR("Failed to take screenshot");
+        return;
+    }
 
     const fs::path save_folder = emuenv.shared_path / "screenshots" / fmt::format("{}", string_utils::remove_special_chars(emuenv.current_app_title));
     fs::create_directories(save_folder);
@@ -634,6 +671,10 @@ bool handle_events(EmuEnvState &emuenv, GuiState &gui) {
                     gui.vita_area.live_area_screen = !gui.vita_area.live_area_screen;
                 }
 
+                // Update the last app frame for live area
+                if (gui.vita_area.live_area_screen)
+                    update_live_area_last_app_frame(emuenv, gui);
+
                 app::switch_state(emuenv, !emuenv.kernel.is_threads_paused());
 
             } else if (!gui::get_sys_apps_state(gui))
@@ -691,7 +732,7 @@ bool handle_events(EmuEnvState &emuenv, GuiState &gui) {
             };
 
             // Get Sce Ctrl button from key
-            const auto sce_ctrl_btn = get_sce_ctrl_btn_from_scancode(event.key.scancode);
+            auto sce_ctrl_btn = get_sce_ctrl_btn_from_scancode(event.key.scancode);
 
             if (gui.is_capturing_keys && event.key.scancode) {
                 gui.is_key_capture_dropped = false;
@@ -707,7 +748,10 @@ bool handle_events(EmuEnvState &emuenv, GuiState &gui) {
 
             if (ImGui::GetIO().WantTextInput || gui.is_key_locked || emuenv.drop_inputs)
                 continue;
-
+#ifdef __ANDROID__
+            if (event.key.scancode == SDL_SCANCODE_AC_BACK)
+                sce_ctrl_btn = SCE_CTRL_PSBUTTON;
+#else
             // toggle gui state
             if (allow_switch_state && (event.key.scancode == emuenv.cfg.keyboard_gui_toggle_gui))
                 emuenv.display.imgui_render = !emuenv.display.imgui_render;
@@ -719,6 +763,7 @@ bool handle_events(EmuEnvState &emuenv, GuiState &gui) {
                 toggle_texture_replacement(emuenv);
             if (event.key.scancode == emuenv.cfg.keyboard_take_screenshot && !gui.is_key_capture_dropped)
                 take_screenshot(emuenv);
+#endif
 
             if (sce_ctrl_btn != 0) {
                 if (last_buttons.contains(sce_ctrl_btn)) {
@@ -766,7 +811,10 @@ bool handle_events(EmuEnvState &emuenv, GuiState &gui) {
             handle_touchpad_event(event.gtouchpad);
             break;
         case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
-            handle_motion_event(emuenv, event.gsensor);
+            handle_motion_event(emuenv, event.gsensor.sensor, event.gsensor);
+            break;
+        case SDL_EVENT_SENSOR_UPDATE:
+            handle_motion_event(emuenv, SDL_GetSensorTypeForID(event.sensor.which), event.sensor);
             break;
         case SDL_EVENT_GAMEPAD_ADDED:
         case SDL_EVENT_GAMEPAD_REMOVED:
