@@ -1,5 +1,5 @@
 // Vita3K emulator project
-// Copyright (C) 2025 Vita3K team
+// Copyright (C) 2026 Vita3K team
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -17,20 +17,8 @@
 
 #pragma once
 
-#include <string>
-#include <util/fs.h>
-#include <vector>
+#include <cstdint>
+#include <cstring>
 
-struct Patch {
-    uint8_t seg;
-    uint32_t offset;
-    std::vector<uint8_t> values;
-};
-
-struct PatchHeader {
-    std::string titleid;
-    std::string bin;
-};
-
-std::vector<Patch> get_patches(fs::path &path, const std::string &titleid, const std::string &bin);
-Patch parse_patch(const std::string &patch);
+bool get_primary_interface_name(char *dest, size_t bufferSize);
+bool get_mac_address(const char *hint, uint8_t mac[6]);
